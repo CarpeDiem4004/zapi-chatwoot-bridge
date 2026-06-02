@@ -1,18 +1,17 @@
 import os
-import json
 import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-CHATWOOT_URL      = os.environ.get("CHATWOOT_URL", "https://chatwoot-production-445d.up.railway.app")
-CHATWOOT_TOKEN    = os.environ.get("CHATWOOT_TOKEN", "eYrrg4RDsWTZosHYv5HnALJH")
-CHATWOOT_ACCOUNT  = os.environ.get("CHATWOOT_ACCOUNT", "1")
-CHATWOOT_INBOX    = os.environ.get("CHATWOOT_INBOX", "1")
+CHATWOOT_URL     = os.environ.get("CHATWOOT_URL", "https://chatwoot-production-445d.up.railway.app")
+CHATWOOT_TOKEN   = os.environ.get("CHATWOOT_TOKEN", "eYrrg4RDsWTZosHYv5HnALJH")
+CHATWOOT_ACCOUNT = os.environ.get("CHATWOOT_ACCOUNT", "1")
+CHATWOOT_INBOX   = os.environ.get("CHATWOOT_INBOX", "1")
 
-ZAPI_INSTANCE     = os.environ.get("ZAPI_INSTANCE", "3F40BC4189F1C1E576D196BA8C2A7842")
-ZAPI_TOKEN        = os.environ.get("ZAPI_TOKEN", "E7B20D229EA5F9EBEB2A6C48")
-ZAPI_URL          = f"https://api.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_TOKEN}"
+ZAPI_INSTANCE    = os.environ.get("ZAPI_INSTANCE", "3F40BC4189F1C1E576D196BA8C2A7842")
+ZAPI_TOKEN       = os.environ.get("ZAPI_TOKEN", "E7B20D229EA5F9EBEB2A6C48")
+ZAPI_URL         = f"https://api.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_TOKEN}"
 
 HEADERS = {
     "api_access_token": CHATWOOT_TOKEN,
@@ -21,7 +20,6 @@ HEADERS = {
 
 BASE = f"{CHATWOOT_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT}"
 
-# Armazena último payload recebido pra debug
 last_payloads = {"zapi": {}, "chatwoot": {}}
 
 
@@ -79,25 +77,30 @@ def chatwoot_webhook():
     if not content:
         return jsonify({"status": "no_content"}), 200
 
+    # O número está em conversation.additional_attributes.phone
+    # ou em sender.phone_number (o contato, não o agente)
     phone = ""
+
+    # 1. conversation.additional_attributes.phone (gravado na criação)
     conversation = data.get("conversation", {})
-    meta = conversation.get("meta", {})
-    sender = meta.get("sender", {})
-    phone = sender.get("identifier") or sender.get("phone_number") or ""
+    phone = conversation.get("additional_attributes", {}).get("phone", "")
 
+    # 2. sender direto no payload (quando é contato)
     if not phone:
-        contact = data.get("contact", {})
-        phone = contact.get("phone_number") or contact.get("identifier") or ""
+        sender = data.get("sender", {})
+        if sender.get("type") == "contact":
+            phone = sender.get("phone_number") or sender.get("identifier") or ""
 
+    # 3. via API do Chatwoot
     if not phone:
-        conv_id = conversation.get("id") or data.get("conversation_id")
+        conv_id = conversation.get("id")
         if conv_id:
             phone = get_phone_from_conversation(conv_id)
 
     phone = str(phone).replace("+", "").replace(" ", "").replace("-", "").strip()
 
     if not phone or len(phone) < 8:
-        return jsonify({"status": "no_phone", "debug_sender": sender, "debug_meta": meta}), 200
+        return jsonify({"status": "no_phone"}), 200
 
     resp = requests.post(f"{ZAPI_URL}/send-text", json={
         "phone": phone,
@@ -112,7 +115,6 @@ def chatwoot_webhook():
     }), 200
 
 
-# ── DEBUG ENDPOINTS ──────────────────────────────
 @app.route("/debug/last", methods=["GET"])
 def debug_last():
     return jsonify(last_payloads), 200
@@ -121,21 +123,18 @@ def debug_last():
 def debug_chatwoot():
     return jsonify(last_payloads["chatwoot"]), 200
 
-@app.route("/debug/zapi", methods=["GET"])
-def debug_zapi():
-    return jsonify(last_payloads["zapi"]), 200
-# ────────────────────────────────────────────────
-
 
 def get_phone_from_conversation(conv_id):
     r = requests.get(f"{BASE}/conversations/{conv_id}", headers=HEADERS)
     if r.status_code == 200:
         conv = r.json()
-        meta = conv.get("meta", {})
-        sender = meta.get("sender", {})
-        phone = sender.get("identifier") or sender.get("phone_number") or ""
+        # additional_attributes.phone
+        phone = conv.get("additional_attributes", {}).get("phone", "")
         if phone:
             return phone
+        # meta.sender
+        meta = conv.get("meta", {})
+        sender = meta.get("sender", {})
         contact_id = sender.get("id")
         if contact_id:
             r2 = requests.get(f"{BASE}/contacts/{contact_id}", headers=HEADERS)
