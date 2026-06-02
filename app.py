@@ -1,6 +1,5 @@
 import os
 import requests
-from requests.adapters import HTTPAdapter
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -21,22 +20,57 @@ HEADERS = {
 }
 
 BASE = f"{CHATWOOT_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT}"
-
 last_payloads = {"zapi": {}, "chatwoot": {}}
 
 
 def cw_get(url, **kwargs):
-    """GET pro Chatwoot com sessão nova a cada chamada"""
     s = requests.Session()
     s.headers.update({"Connection": "close"})
     return s.get(url, headers=HEADERS, timeout=15, **kwargs)
 
 
 def cw_post(url, **kwargs):
-    """POST pro Chatwoot com sessão nova a cada chamada"""
     s = requests.Session()
     s.headers.update({"Connection": "close"})
     return s.post(url, headers=HEADERS, timeout=15, **kwargs)
+
+
+def extract_phone(data):
+    """Extrai o número do contato do payload do Chatwoot — tenta todos os caminhos conhecidos"""
+    phone = ""
+
+    # 1. conversation.additional_attributes.phone (gravado na criação pelo bridge)
+    conv = data.get("conversation", {})
+    phone = conv.get("additional_attributes", {}).get("phone", "")
+    if phone:
+        return clean_phone(phone)
+
+    # 2. conversation.meta.sender.phone_number (mais confiável — tipo contact)
+    meta = conv.get("meta", {})
+    sender = meta.get("sender", {})
+    phone = sender.get("phone_number", "") or sender.get("identifier", "")
+    if phone:
+        return clean_phone(phone)
+
+    # 3. Qualquer sender no payload raiz com phone_number
+    for key in ["sender", "contact"]:
+        s = data.get(key, {})
+        phone = s.get("phone_number", "") or s.get("identifier", "")
+        if phone and len(str(phone)) > 8:
+            return clean_phone(phone)
+
+    # 4. Via API do Chatwoot
+    conv_id = conv.get("id")
+    if conv_id:
+        phone = get_phone_from_conversation(conv_id)
+        if phone:
+            return clean_phone(phone)
+
+    return ""
+
+
+def clean_phone(phone):
+    return str(phone).replace("+", "").replace(" ", "").replace("-", "").strip()
 
 
 @app.route("/webhook/zapi", methods=["POST"])
@@ -47,7 +81,11 @@ def zapi_webhook():
     if data.get("fromMe") or not data.get("phone"):
         return jsonify({"status": "ignored"}), 200
 
-    phone = data.get("phone", "").replace("+", "").replace(" ", "").replace("-", "")
+    # Ignora grupos
+    if data.get("isGroup"):
+        return jsonify({"status": "ignored_group"}), 200
+
+    phone = clean_phone(data.get("phone", ""))
     name  = data.get("senderName") or data.get("pushName") or phone
     text  = ""
 
@@ -93,29 +131,10 @@ def chatwoot_webhook():
     if not content:
         return jsonify({"status": "no_content"}), 200
 
-    phone = ""
-
-    # 1. conversation.additional_attributes.phone
-    conversation = data.get("conversation", {})
-    phone = conversation.get("additional_attributes", {}).get("phone", "")
-
-    # 2. meta.sender (contato)
-    if not phone:
-        meta = conversation.get("meta", {})
-        sender = meta.get("sender", {})
-        if sender.get("type") == "contact":
-            phone = sender.get("phone_number") or sender.get("identifier") or ""
-
-    # 3. via API
-    if not phone:
-        conv_id = conversation.get("id")
-        if conv_id:
-            phone = get_phone_from_conversation(conv_id)
-
-    phone = str(phone).replace("+", "").replace(" ", "").replace("-", "").strip()
+    phone = extract_phone(data)
 
     if not phone or len(phone) < 8:
-        return jsonify({"status": "no_phone"}), 200
+        return jsonify({"status": "no_phone", "tried": "all_paths"}), 200
 
     resp = requests.post(f"{ZAPI_URL}/send-text", json={
         "phone": phone,
@@ -149,6 +168,9 @@ def get_phone_from_conversation(conv_id):
                 return phone
             meta = conv.get("meta", {})
             sender = meta.get("sender", {})
+            phone = sender.get("phone_number") or sender.get("identifier") or ""
+            if phone:
+                return phone
             contact_id = sender.get("id")
             if contact_id:
                 r2 = cw_get(f"{BASE}/contacts/{contact_id}")
@@ -169,7 +191,6 @@ def get_or_create_contact(phone, name):
                 return results[0]["id"]
     except Exception:
         pass
-
     try:
         r = cw_post(f"{BASE}/contacts", json={
             "name": name,
@@ -193,7 +214,6 @@ def get_or_create_conversation(contact_id, phone):
                     return conv["id"]
     except Exception:
         pass
-
     try:
         r = cw_post(f"{BASE}/conversations", json={
             "inbox_id": int(CHATWOOT_INBOX),
