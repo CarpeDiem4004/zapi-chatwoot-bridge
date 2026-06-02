@@ -1,5 +1,6 @@
 import os
 import requests
+from requests.adapters import HTTPAdapter
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -15,12 +16,27 @@ ZAPI_URL         = f"https://api.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_
 
 HEADERS = {
     "api_access_token": CHATWOOT_TOKEN,
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
+    "Connection": "close"
 }
 
 BASE = f"{CHATWOOT_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT}"
 
 last_payloads = {"zapi": {}, "chatwoot": {}}
+
+
+def cw_get(url, **kwargs):
+    """GET pro Chatwoot com sessão nova a cada chamada"""
+    s = requests.Session()
+    s.headers.update({"Connection": "close"})
+    return s.get(url, headers=HEADERS, timeout=15, **kwargs)
+
+
+def cw_post(url, **kwargs):
+    """POST pro Chatwoot com sessão nova a cada chamada"""
+    s = requests.Session()
+    s.headers.update({"Connection": "close"})
+    return s.post(url, headers=HEADERS, timeout=15, **kwargs)
 
 
 @app.route("/webhook/zapi", methods=["POST"])
@@ -77,21 +93,20 @@ def chatwoot_webhook():
     if not content:
         return jsonify({"status": "no_content"}), 200
 
-    # O número está em conversation.additional_attributes.phone
-    # ou em sender.phone_number (o contato, não o agente)
     phone = ""
 
-    # 1. conversation.additional_attributes.phone (gravado na criação)
+    # 1. conversation.additional_attributes.phone
     conversation = data.get("conversation", {})
     phone = conversation.get("additional_attributes", {}).get("phone", "")
 
-    # 2. sender direto no payload (quando é contato)
+    # 2. meta.sender (contato)
     if not phone:
-        sender = data.get("sender", {})
+        meta = conversation.get("meta", {})
+        sender = meta.get("sender", {})
         if sender.get("type") == "contact":
             phone = sender.get("phone_number") or sender.get("identifier") or ""
 
-    # 3. via API do Chatwoot
+    # 3. via API
     if not phone:
         conv_id = conversation.get("id")
         if conv_id:
@@ -105,7 +120,7 @@ def chatwoot_webhook():
     resp = requests.post(f"{ZAPI_URL}/send-text", json={
         "phone": phone,
         "message": content
-    })
+    }, timeout=15)
 
     return jsonify({
         "status": "sent",
@@ -125,73 +140,85 @@ def debug_chatwoot():
 
 
 def get_phone_from_conversation(conv_id):
-    r = requests.get(f"{BASE}/conversations/{conv_id}", headers=HEADERS)
-    if r.status_code == 200:
-        conv = r.json()
-        # additional_attributes.phone
-        phone = conv.get("additional_attributes", {}).get("phone", "")
-        if phone:
-            return phone
-        # meta.sender
-        meta = conv.get("meta", {})
-        sender = meta.get("sender", {})
-        contact_id = sender.get("id")
-        if contact_id:
-            r2 = requests.get(f"{BASE}/contacts/{contact_id}", headers=HEADERS)
-            if r2.status_code == 200:
-                c = r2.json()
-                return c.get("phone_number") or c.get("identifier") or ""
+    try:
+        r = cw_get(f"{BASE}/conversations/{conv_id}")
+        if r.status_code == 200:
+            conv = r.json()
+            phone = conv.get("additional_attributes", {}).get("phone", "")
+            if phone:
+                return phone
+            meta = conv.get("meta", {})
+            sender = meta.get("sender", {})
+            contact_id = sender.get("id")
+            if contact_id:
+                r2 = cw_get(f"{BASE}/contacts/{contact_id}")
+                if r2.status_code == 200:
+                    c = r2.json()
+                    return c.get("phone_number") or c.get("identifier") or ""
+    except Exception:
+        pass
     return ""
 
 
 def get_or_create_contact(phone, name):
-    r = requests.get(f"{BASE}/contacts/search", params={"q": phone, "page": 1}, headers=HEADERS)
-    if r.status_code == 200:
-        results = r.json().get("payload", [])
-        if results:
-            return results[0]["id"]
+    try:
+        r = cw_get(f"{BASE}/contacts/search", params={"q": phone, "page": 1})
+        if r.status_code == 200:
+            results = r.json().get("payload", [])
+            if results:
+                return results[0]["id"]
+    except Exception:
+        pass
 
-    r = requests.post(f"{BASE}/contacts", json={
-        "name": name,
-        "phone_number": f"+{phone}",
-        "identifier": phone
-    }, headers=HEADERS)
-
-    if r.status_code in [200, 201]:
-        return r.json().get("id")
+    try:
+        r = cw_post(f"{BASE}/contacts", json={
+            "name": name,
+            "phone_number": f"+{phone}",
+            "identifier": phone
+        })
+        if r.status_code in [200, 201]:
+            return r.json().get("id")
+    except Exception:
+        pass
     return None
 
 
 def get_or_create_conversation(contact_id, phone):
-    r = requests.get(f"{BASE}/contacts/{contact_id}/conversations", headers=HEADERS)
-    if r.status_code == 200:
-        conversations = r.json().get("payload", [])
-        for conv in conversations:
-            if (str(conv.get("inbox_id")) == str(CHATWOOT_INBOX) and
-                    conv.get("status") == "open"):
-                return conv["id"]
+    try:
+        r = cw_get(f"{BASE}/contacts/{contact_id}/conversations")
+        if r.status_code == 200:
+            for conv in r.json().get("payload", []):
+                if (str(conv.get("inbox_id")) == str(CHATWOOT_INBOX) and
+                        conv.get("status") == "open"):
+                    return conv["id"]
+    except Exception:
+        pass
 
-    r = requests.post(f"{BASE}/conversations", json={
-        "inbox_id": int(CHATWOOT_INBOX),
-        "contact_id": contact_id,
-        "additional_attributes": {"phone": phone}
-    }, headers=HEADERS)
-
-    if r.status_code in [200, 201]:
-        return r.json().get("id")
+    try:
+        r = cw_post(f"{BASE}/conversations", json={
+            "inbox_id": int(CHATWOOT_INBOX),
+            "contact_id": contact_id,
+            "additional_attributes": {"phone": phone}
+        })
+        if r.status_code in [200, 201]:
+            return r.json().get("id")
+    except Exception:
+        pass
     return None
 
 
 def send_message_to_chatwoot(conversation_id, text, incoming=True):
-    requests.post(
-        f"{BASE}/conversations/{conversation_id}/messages",
-        json={
-            "content": text,
-            "message_type": "incoming" if incoming else "outgoing",
-            "private": False
-        },
-        headers=HEADERS
-    )
+    try:
+        cw_post(
+            f"{BASE}/conversations/{conversation_id}/messages",
+            json={
+                "content": text,
+                "message_type": "incoming" if incoming else "outgoing",
+                "private": False
+            }
+        )
+    except Exception:
+        pass
 
 
 @app.route("/health", methods=["GET"])
