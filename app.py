@@ -21,6 +21,7 @@ HEADERS = {
 
 BASE = f"{CHATWOOT_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT}"
 
+
 # ==========================================
 # RECEBE MENSAGEM DA Z-API → ENVIA PRO CHATWOOT
 # ==========================================
@@ -28,39 +29,34 @@ BASE = f"{CHATWOOT_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT}"
 def zapi_webhook():
     data = request.json or {}
 
-    # Ignora eventos que não são mensagens recebidas
     if data.get("fromMe") or not data.get("phone"):
         return jsonify({"status": "ignored"}), 200
 
-    phone   = data.get("phone", "").replace("+", "").replace(" ", "").replace("-", "")
-    name    = data.get("senderName") or data.get("pushName") or phone
-    text    = ""
+    phone = data.get("phone", "").replace("+", "").replace(" ", "").replace("-", "")
+    name  = data.get("senderName") or data.get("pushName") or phone
+    text  = ""
 
-    # Extrai o texto dependendo do tipo de mensagem
     msg_type = data.get("type", "")
     if msg_type == "ReceivedCallback":
-        text = data.get("text", {}).get("message", "") if isinstance(data.get("text"), dict) else data.get("text", "")
+        t = data.get("text", "")
+        text = t.get("message", "") if isinstance(t, dict) else str(t)
     elif msg_type in ["AudioCallback", "VideoCallback", "ImageCallback", "DocumentCallback"]:
-        text = f"[{msg_type.replace('Callback','')} recebido — não suportado em texto]"
+        text = f"[{msg_type.replace('Callback','')} recebido]"
     else:
         text = str(data.get("text", "") or data.get("body", "") or "")
 
     if not text:
         return jsonify({"status": "no_text"}), 200
 
-    # 1. Busca ou cria contato no Chatwoot
     contact_id = get_or_create_contact(phone, name)
     if not contact_id:
-        return jsonify({"status": "error", "msg": "contact creation failed"}), 500
+        return jsonify({"status": "error", "msg": "contact failed"}), 500
 
-    # 2. Busca conversa aberta ou cria nova
     conversation_id = get_or_create_conversation(contact_id, phone)
     if not conversation_id:
-        return jsonify({"status": "error", "msg": "conversation creation failed"}), 500
+        return jsonify({"status": "error", "msg": "conversation failed"}), 500
 
-    # 3. Envia a mensagem pra conversa
     send_message_to_chatwoot(conversation_id, text, incoming=True)
-
     return jsonify({"status": "ok"}), 200
 
 
@@ -74,47 +70,74 @@ def chatwoot_webhook():
     if data.get("event") != "message_created":
         return jsonify({"status": "ignored"}), 200
 
-    msg = data.get("message_type")
-    if msg != "outgoing":
+    if data.get("message_type") != "outgoing":
         return jsonify({"status": "ignored"}), 200
+
+    if data.get("private"):
+        return jsonify({"status": "ignored_private"}), 200
 
     content = data.get("content", "")
     if not content:
         return jsonify({"status": "no_content"}), 200
 
-    # Pega o número do contato da conversa
+    phone = ""
+
+    # Tenta pegar o número de vários lugares do payload
     conversation = data.get("conversation", {})
     meta = conversation.get("meta", {})
     sender = meta.get("sender", {})
-
-    # O identificador do contato (source_id = phone)
-    contact_identifier = sender.get("identifier") or sender.get("phone_number") or ""
-    phone = contact_identifier.replace("+", "").replace(" ", "").replace("-", "")
+    phone = (sender.get("identifier") or sender.get("phone_number") or "")
 
     if not phone:
-        return jsonify({"status": "no_phone"}), 200
+        contact = data.get("contact", {})
+        phone = (contact.get("phone_number") or contact.get("identifier") or "")
 
-    # Envia via Z-API
+    if not phone:
+        conv_id = conversation.get("id") or data.get("conversation_id")
+        if conv_id:
+            phone = get_phone_from_conversation(conv_id)
+
+    phone = str(phone).replace("+", "").replace(" ", "").replace("-", "").strip()
+
+    if not phone or len(phone) < 8:
+        return jsonify({"status": "no_phone", "debug_sender": str(sender)}), 200
+
     resp = requests.post(f"{ZAPI_URL}/send-text", json={
         "phone": phone,
         "message": content
     })
 
-    return jsonify({"status": "sent", "zapi": resp.status_code}), 200
+    return jsonify({"status": "sent", "phone": phone, "zapi": resp.status_code}), 200
 
 
 # ==========================================
 # HELPERS
 # ==========================================
+def get_phone_from_conversation(conv_id):
+    r = requests.get(f"{BASE}/conversations/{conv_id}", headers=HEADERS)
+    if r.status_code == 200:
+        conv = r.json()
+        meta = conv.get("meta", {})
+        sender = meta.get("sender", {})
+        phone = sender.get("identifier") or sender.get("phone_number") or ""
+        if phone:
+            return phone
+        contact_id = sender.get("id")
+        if contact_id:
+            r2 = requests.get(f"{BASE}/contacts/{contact_id}", headers=HEADERS)
+            if r2.status_code == 200:
+                c = r2.json()
+                return c.get("phone_number") or c.get("identifier") or ""
+    return ""
+
+
 def get_or_create_contact(phone, name):
-    # Busca por telefone
     r = requests.get(f"{BASE}/contacts/search", params={"q": phone, "page": 1}, headers=HEADERS)
     if r.status_code == 200:
         results = r.json().get("payload", [])
         if results:
             return results[0]["id"]
 
-    # Cria se não existir
     r = requests.post(f"{BASE}/contacts", json={
         "name": name,
         "phone_number": f"+{phone}",
@@ -127,7 +150,6 @@ def get_or_create_contact(phone, name):
 
 
 def get_or_create_conversation(contact_id, phone):
-    # Busca conversas abertas do contato nessa inbox
     r = requests.get(f"{BASE}/contacts/{contact_id}/conversations", headers=HEADERS)
     if r.status_code == 200:
         conversations = r.json().get("payload", [])
@@ -136,7 +158,6 @@ def get_or_create_conversation(contact_id, phone):
                     conv.get("status") == "open"):
                 return conv["id"]
 
-    # Cria nova conversa
     r = requests.post(f"{BASE}/conversations", json={
         "inbox_id": int(CHATWOOT_INBOX),
         "contact_id": contact_id,
