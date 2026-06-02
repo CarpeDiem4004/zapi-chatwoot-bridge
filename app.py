@@ -1,10 +1,10 @@
 import os
+import json
 import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# === CONFIGURAÇÕES ===
 CHATWOOT_URL      = os.environ.get("CHATWOOT_URL", "https://chatwoot-production-445d.up.railway.app")
 CHATWOOT_TOKEN    = os.environ.get("CHATWOOT_TOKEN", "eYrrg4RDsWTZosHYv5HnALJH")
 CHATWOOT_ACCOUNT  = os.environ.get("CHATWOOT_ACCOUNT", "1")
@@ -21,13 +21,14 @@ HEADERS = {
 
 BASE = f"{CHATWOOT_URL}/api/v1/accounts/{CHATWOOT_ACCOUNT}"
 
+# Armazena último payload recebido pra debug
+last_payloads = {"zapi": {}, "chatwoot": {}}
 
-# ==========================================
-# RECEBE MENSAGEM DA Z-API → ENVIA PRO CHATWOOT
-# ==========================================
+
 @app.route("/webhook/zapi", methods=["POST"])
 def zapi_webhook():
     data = request.json or {}
+    last_payloads["zapi"] = data
 
     if data.get("fromMe") or not data.get("phone"):
         return jsonify({"status": "ignored"}), 200
@@ -60,12 +61,10 @@ def zapi_webhook():
     return jsonify({"status": "ok"}), 200
 
 
-# ==========================================
-# RECEBE RESPOSTA DO CHATWOOT → ENVIA PRO ZAPI
-# ==========================================
 @app.route("/webhook/chatwoot", methods=["POST"])
 def chatwoot_webhook():
     data = request.json or {}
+    last_payloads["chatwoot"] = data
 
     if data.get("event") != "message_created":
         return jsonify({"status": "ignored"}), 200
@@ -81,16 +80,14 @@ def chatwoot_webhook():
         return jsonify({"status": "no_content"}), 200
 
     phone = ""
-
-    # Tenta pegar o número de vários lugares do payload
     conversation = data.get("conversation", {})
     meta = conversation.get("meta", {})
     sender = meta.get("sender", {})
-    phone = (sender.get("identifier") or sender.get("phone_number") or "")
+    phone = sender.get("identifier") or sender.get("phone_number") or ""
 
     if not phone:
         contact = data.get("contact", {})
-        phone = (contact.get("phone_number") or contact.get("identifier") or "")
+        phone = contact.get("phone_number") or contact.get("identifier") or ""
 
     if not phone:
         conv_id = conversation.get("id") or data.get("conversation_id")
@@ -100,19 +97,36 @@ def chatwoot_webhook():
     phone = str(phone).replace("+", "").replace(" ", "").replace("-", "").strip()
 
     if not phone or len(phone) < 8:
-        return jsonify({"status": "no_phone", "debug_sender": str(sender)}), 200
+        return jsonify({"status": "no_phone", "debug_sender": sender, "debug_meta": meta}), 200
 
     resp = requests.post(f"{ZAPI_URL}/send-text", json={
         "phone": phone,
         "message": content
     })
 
-    return jsonify({"status": "sent", "phone": phone, "zapi": resp.status_code}), 200
+    return jsonify({
+        "status": "sent",
+        "phone": phone,
+        "zapi_status": resp.status_code,
+        "zapi_response": resp.text
+    }), 200
 
 
-# ==========================================
-# HELPERS
-# ==========================================
+# ── DEBUG ENDPOINTS ──────────────────────────────
+@app.route("/debug/last", methods=["GET"])
+def debug_last():
+    return jsonify(last_payloads), 200
+
+@app.route("/debug/chatwoot", methods=["GET"])
+def debug_chatwoot():
+    return jsonify(last_payloads["chatwoot"]), 200
+
+@app.route("/debug/zapi", methods=["GET"])
+def debug_zapi():
+    return jsonify(last_payloads["zapi"]), 200
+# ────────────────────────────────────────────────
+
+
 def get_phone_from_conversation(conv_id):
     r = requests.get(f"{BASE}/conversations/{conv_id}", headers=HEADERS)
     if r.status_code == 200:
