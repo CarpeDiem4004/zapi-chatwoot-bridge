@@ -249,3 +249,34 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
+
+@app.route("/debug/test-extract", methods=["GET"])
+def debug_test_extract():
+    """Testa o extract_phone com o último payload do Chatwoot"""
+    data = last_payloads.get("chatwoot", {})
+    if not data:
+        return jsonify({"error": "no chatwoot payload yet"}), 200
+    
+    conv = data.get("conversation", {})
+    
+    # Testa cada path manualmente
+    path1 = conv.get("additional_attributes", {}).get("phone", "")
+    
+    meta = conv.get("meta", {})
+    sender_meta = meta.get("sender", {})
+    path2 = sender_meta.get("phone_number", "") or sender_meta.get("identifier", "")
+    
+    sender_root = data.get("sender", {})
+    path3 = sender_root.get("phone_number", "") or sender_root.get("identifier", "")
+    
+    result = extract_phone(data)
+    
+    return jsonify({
+        "path1_additional_attributes": path1,
+        "path2_meta_sender": path2,
+        "path3_root_sender": path3,
+        "extract_phone_result": result,
+        "conv_keys": list(conv.keys()) if conv else [],
+        "additional_attributes_raw": conv.get("additional_attributes", "NOT_FOUND")
+    }), 200
